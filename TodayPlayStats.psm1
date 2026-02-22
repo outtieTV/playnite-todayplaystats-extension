@@ -1,20 +1,38 @@
-# TodayPlayStats.psm1
+# =========================================================
+# TodayPlayStats - Combined Robust Version
+# =========================================================
 
 # ---------------------------------------------------------
 # Menu Integration
 # ---------------------------------------------------------
-
 function GetMainMenuItems {
     param($args)
-    $item = New-Object Playnite.SDK.Plugins.ScriptMainMenuItem
-    $item.Description = "Show Today's Play Stats"
-    $item.FunctionName = "Show-TodayStats"
-    return $item
+    $items = @()
+    
+    $item1 = New-Object Playnite.SDK.Plugins.ScriptMainMenuItem
+    $item1.Description = "Show Today's Play Stats"
+    $item1.FunctionName = "Show-TodayStats"
+    $items += $item1
+
+    $item2 = New-Object Playnite.SDK.Plugins.ScriptMainMenuItem
+    $item2.Description = "Show Top Played Game Today"
+    $item2.FunctionName = "Show-TopPlayedToday"
+    $items += $item2
+
+    $item3 = New-Object Playnite.SDK.Plugins.ScriptMainMenuItem
+    $item3.Description = "Reset Selected Game Stats"
+    $item3.FunctionName = "Reset-TodayStats"
+    $items += $item3
+
+    return $items
 }
+
+# ---------------------------------------------------------
+# Logic Functions
+# ---------------------------------------------------------
 
 function Show-TodayStats {
     param($args)
-    # Define paths locally so they are never null
     $CSVPath = Join-Path $PSScriptRoot "sessions.csv"
     
     $selected = $PlayniteApi.MainView.SelectedGames
@@ -25,30 +43,77 @@ function Show-TodayStats {
 
     $game = $selected[0]
     $gameId = $game.Id.ToString()
-    $today = (Get-Date).ToString("yyyy-MM-dd")
+    
+    # Check both formats just in case
+    $t1 = (Get-Date).ToString("yyyy-MM-dd")
+    $t2 = (Get-Date).ToString("M/d/yyyy")
 
     if (-not (Test-Path $CSVPath)) {
-        $PlayniteApi.Dialogs.ShowMessage("No sessions recorded yet. Start a game to begin tracking!", "Today Stats")
+        $PlayniteApi.Dialogs.ShowMessage("$($game.Name)`nTotal Today: 0h 0m", "Today Stats")
         return
     }
 
+    # Import and filter
     $sessions = Import-Csv -Path $CSVPath | Where-Object { 
-        $_.game_id -eq $gameId -and $_.date -eq $today 
-    }
-
-    if (-not $sessions) {
-        $PlayniteApi.Dialogs.ShowMessage("No recorded sessions for $($game.Name) today.", "Today Stats")
-        return
+        $_.game_id -eq $gameId -and ($_.date -eq $t1 -or $_.date -eq $t2)
     }
 
     $totalSeconds = 0
-    # CSV values are strings by default, force to INT
-    foreach ($s in @($sessions)) { $totalSeconds += [int]$s.duration_seconds }
+    if ($sessions) {
+        foreach ($s in @($sessions)) { $totalSeconds += [int]$s.duration_seconds }
+    }
 
     $h = [math]::Floor($totalSeconds / 3600)
     $m = [math]::Floor(($totalSeconds % 3600) / 60)
 
-    $PlayniteApi.Dialogs.ShowMessage("$($game.Name)`nDate: $today`n`nTotal Today: $h h $m m", "Today Stats")
+    $PlayniteApi.Dialogs.ShowMessage("$($game.Name)`nTotal Today: $h h $m m", "Today Stats")
+}
+
+function Show-TopPlayedToday {
+    param($args)
+    $CSVPath = Join-Path $PSScriptRoot "sessions.csv"
+    if (-not (Test-Path $CSVPath)) {
+        $PlayniteApi.Dialogs.ShowMessage("No stats recorded.", "Top Played")
+        return
+    }
+
+    $t1 = (Get-Date).ToString("yyyy-MM-dd")
+    $t2 = (Get-Date).ToString("M/d/yyyy")
+
+    $sessions = Import-Csv -Path $CSVPath | Where-Object { $_.date -eq $t1 -or $_.date -eq $t2 }
+    if (-not $sessions) {
+        $PlayniteApi.Dialogs.ShowMessage("No sessions today.", "Top Played")
+        return
+    }
+
+    $top = $sessions | Group-Object game_id | ForEach-Object {
+        [PSCustomObject]@{
+            Name = $_.Group[0].game_name
+            Time = ($_.Group | Measure-Object duration_seconds -Sum).Sum
+        }
+    } | Sort-Object Time -Descending | Select-Object -First 1
+
+    $h = [math]::Floor($top.Time / 3600)
+    $m = [math]::Floor(($top.Time % 3600) / 60)
+
+    $PlayniteApi.Dialogs.ShowMessage("Top Today: $($top.Name)`nTime: $h h $m m", "Top Played")
+}
+
+function Reset-TodayStats {
+    param($args)
+    $CSVPath = Join-Path $PSScriptRoot "sessions.csv"
+    $selected = $PlayniteApi.MainView.SelectedGames
+    if (-not $selected -or $selected.Count -eq 0 -or -not (Test-Path $CSVPath)) { return }
+
+    $targetId = $selected[0].Id.ToString()
+    $remaining = Import-Csv -Path $CSVPath | Where-Object { $_.game_id -ne $targetId }
+
+    if ($remaining) {
+        $remaining | Export-Csv -Path $CSVPath -NoTypeInformation -Encoding utf8 -Force
+    } else {
+        Remove-Item $CSVPath -ErrorAction SilentlyContinue
+    }
+    $PlayniteApi.Dialogs.ShowMessage("Cleared stats for $($selected[0].Name)", "Reset")
 }
 
 # ---------------------------------------------------------
@@ -57,31 +122,35 @@ function Show-TodayStats {
 
 function OnGameStarted {
     param($args)
-    $game = $args.Game
-    if ($null -eq $game) { return }
-
     $ActivePath = Join-Path $PSScriptRoot "active_sessions.csv"
+    $CSVPath = Join-Path $PSScriptRoot "sessions.csv"
 
-    $newSession = [PSCustomObject]@{
-        game_id    = $game.Id.ToString()
-        game_name  = $game.Name
-        start_time = (Get-Date).ToString("o")
+    # Cleanup Old Days (Maintenance)
+    if (Test-Path $CSVPath) {
+        $t1 = (Get-Date).ToString("yyyy-MM-dd")
+        $t2 = (Get-Date).ToString("M/d/yyyy")
+        $current = Import-Csv $CSVPath
+        if (-not ($current | Where-Object { $_.date -eq $t1 -or $_.date -eq $t2 })) {
+            Remove-Item $CSVPath -Force
+        }
     }
 
+    $newSession = [PSCustomObject]@{
+        game_id    = $args.Game.Id.ToString()
+        game_name  = $args.Game.Name
+        start_time = (Get-Date).ToString("o")
+    }
     $newSession | Export-Csv -Path $ActivePath -Append -NoTypeInformation -Encoding utf8
 }
 
 function OnGameStopped {
     param($args)
-    $game = $args.Game
-    if ($null -eq $game) { return }
-    
     $ActivePath = Join-Path $PSScriptRoot "active_sessions.csv"
     $CSVPath    = Join-Path $PSScriptRoot "sessions.csv"
 
     if (-not (Test-Path $ActivePath)) { return }
 
-    $gameId = $game.Id.ToString()
+    $gameId = $args.Game.Id.ToString()
     $activeItems = Import-Csv -Path $ActivePath
     $remaining = @()
 
@@ -90,19 +159,18 @@ function OnGameStopped {
             $start = [datetime]::Parse($item.start_time)
             $duration = [int]((Get-Date) - $start).TotalSeconds
             
-            $finishedSession = [PSCustomObject]@{
+            $finished = [PSCustomObject]@{
                 game_id          = $item.game_id
                 game_name        = $item.game_name
-                date             = (Get-Date).ToString("yyyy-MM-dd")
+                date              = (Get-Date).ToString("yyyy-MM-dd")
                 duration_seconds = $duration
             }
-            $finishedSession | Export-Csv -Path $CSVPath -Append -NoTypeInformation -Encoding utf8
+            $finished | Export-Csv -Path $CSVPath -Append -NoTypeInformation -Encoding utf8
         } else {
             $remaining += $item
         }
     }
 
-    # Update active list
     if ($remaining.Count -gt 0) {
         $remaining | Export-Csv -Path $ActivePath -Force -NoTypeInformation -Encoding utf8
     } else {
@@ -113,4 +181,4 @@ function OnGameStopped {
 # ---------------------------------------------------------
 # Exports
 # ---------------------------------------------------------
-Export-ModuleMember -Function GetMainMenuItems, Show-TodayStats, OnGameStarted, OnGameStopped
+Export-ModuleMember -Function GetMainMenuItems, Show-TodayStats, Show-TopPlayedToday, Reset-TodayStats, OnGameStarted, OnGameStopped
